@@ -13,6 +13,7 @@ from typing import Any
 
 from hermes_cli import kanban_db as kb
 from hermes_constants import get_hermes_home
+from utils import atomic_json_write
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)api[_-]?key\s*[:=]\s*\S+"),
@@ -186,7 +187,15 @@ def _event_ref(event: kb.Event) -> dict[str, Any]:
     }
 
 
-def _extract_decisions(task: kb.Task | None, comments: list[kb.Comment], runs: list[kb.Run]) -> list[str]:
+def _extract_decisions(
+    task: kb.Task | None,
+    comments: list[kb.Comment],
+    runs: list[kb.Run],
+    *,
+    linear_comments: list[dict[str, Any]] | None = None,
+    linear_issue_status: str | None = None,
+    linear_previous_status: str | None = None,
+) -> list[str]:
     decisions: list[str] = []
     if task and task.assignee:
         decisions.append(f"Task remains assigned to {task.assignee} with durable status {task.status}.")
@@ -201,6 +210,22 @@ def _extract_decisions(task: kb.Task | None, comments: list[kb.Comment], runs: l
             decisions.append(_redact_text(comment.body.strip().splitlines()[0]))
         if len(decisions) >= 5:
             break
+
+    # Linear comments as a decision source (when no Kanban task is attached)
+    if linear_comments:
+        for comment in reversed(linear_comments):
+            body = str(comment.get("body") or "").lower()
+            if any(word in body for word in ("decision", "decided", "approved", "reject", "accept")):
+                decisions.append(_redact_text(str(comment.get("body", "")).strip().splitlines()[0]))
+            if len(decisions) >= 5:
+                break
+
+    # Linear issue status transition counts as a decision
+    if linear_issue_status and linear_previous_status and linear_issue_status != linear_previous_status:
+        decisions.append(
+            f"Linear issue transitioned from {linear_previous_status} → {linear_issue_status}."
+        )
+
     out: list[str] = []
     seen: set[str] = set()
     for item in decisions:
@@ -256,12 +281,19 @@ def _score_closeout(
     evidence_count: int,
     human_review_count: int,
     include_memory: bool,
+    task_scan_status: str | None = None,
+    blocker_scan_status: str | None = None,
 ) -> tuple[dict[str, int], int, str]:
+    task_signal = task is not None or task_scan_status in {"no_followup_required", "followup_items_found"}
+    has_open_blockers = bool(blockers) or blocker_scan_status in {"open_blockers_found", "blocked", "blockers_found"}
+    blocker_signal = (not has_open_blockers) and (
+        blocker_scan_status == "no_open_blockers" or bool(task and task.status in {"done", "archived"})
+    )
     dimensions = {
         "durable_anchor": 2 if has_anchor else 0,
         "decisions": 2 if decisions else 0,
-        "tasks": 2 if task else 0,
-        "blockers": 2 if blockers else (1 if task and task.status in {"done", "archived"} else 0),
+        "tasks": 2 if task_signal else 0,
+        "blockers": 2 if blocker_signal else 0,
         "evidence": 2 if evidence_count >= 2 else (1 if evidence_count == 1 else 0),
         "human_review": 2 if human_review_count == 0 else 1,
         "linear": 1,
@@ -270,7 +302,7 @@ def _score_closeout(
         "human_response": 2,
     }
     total = sum(dimensions.values())
-    blocked = (not has_anchor) or human_review_count > 0
+    blocked = (not has_anchor) or human_review_count > 0 or has_open_blockers
     if blocked:
         status = "BLOCKED"
     elif total >= 18:
@@ -330,11 +362,54 @@ def _write_packet_files(packet: dict[str, Any], response_text: str, slug: str, n
     return str(json_path), str(md_path)
 
 
+def write_close_thread_receipt(
+    *,
+    packet_path: str,
+    discord_thread_id: str,
+    mutation_reason: str,
+    verified_channel_state: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> str:
+    now_dt = now or datetime.now().astimezone()
+    packet = Path(packet_path).expanduser()
+    if not packet.exists():
+        raise ValueError(f"close-thread packet does not exist: {packet}")
+    closeouts_root = (closeout_root() / "closeouts").resolve()
+    resolved_packet = packet.resolve()
+    try:
+        resolved_packet.relative_to(closeouts_root)
+    except ValueError as exc:
+        raise ValueError(f"close-thread packet must be under {closeouts_root}: {resolved_packet}") from exc
+
+    state = _redact(deepcopy(verified_channel_state or {}))
+    metadata = state.get("thread_metadata") if isinstance(state, dict) else None
+    metadata = metadata if isinstance(metadata, dict) else {}
+    archived = metadata.get("archived") is True
+    locked = metadata.get("locked") is True
+    receipt = {
+        "schema_version": "CLOSE_THREAD_RECEIPT.v1",
+        "packet_path": str(resolved_packet),
+        "discord_thread_id": str(discord_thread_id),
+        "archive_attempted": True,
+        "archive_succeeded": archived,
+        "locked": locked,
+        "verified_at": now_dt.isoformat(),
+        "mutation_reason": _redact_text(mutation_reason),
+        "verified_channel_state": state,
+    }
+    out = resolved_packet.with_suffix(".receipt.json")
+    if out.is_symlink():
+        raise ValueError(f"receipt path must not be a symlink: {out}")
+    atomic_json_write(out, receipt, indent=2)
+    return str(out)
+
+
 def build_close_thread_packet(
     command_text: str,
     *,
     source: dict[str, Any] | None = None,
     session: dict[str, Any] | None = None,
+    closeout_context: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> tuple[dict[str, Any], str]:
     opts = parse_close_thread_command(command_text)
@@ -342,6 +417,20 @@ def build_close_thread_packet(
     invoked_at = now_dt.isoformat()
     source = _redact(deepcopy(source or {}))
     session = _redact(deepcopy(session or {}))
+    context_data = _redact(deepcopy(closeout_context or {}))
+    closeout_context = context_data if isinstance(context_data, dict) else {}
+    extracted_value = closeout_context.get("extracted")
+    implementation_value = closeout_context.get("implementation_refs")
+    transcript_value = closeout_context.get("thread_transcript")
+    session_refs_value = closeout_context.get("session_refs")
+    task_scan_value = closeout_context.get("task_scan")
+    blocker_scan_value = closeout_context.get("blocker_scan")
+    extracted_context = extracted_value if isinstance(extracted_value, dict) else {}
+    implementation_context = implementation_value if isinstance(implementation_value, dict) else {}
+    thread_transcript = transcript_value if isinstance(transcript_value, dict) else {}
+    session_refs_context = session_refs_value if isinstance(session_refs_value, dict) else {}
+    task_scan = task_scan_value if isinstance(task_scan_value, dict) else {}
+    blocker_scan = blocker_scan_value if isinstance(blocker_scan_value, dict) else {}
 
     kb.init_db()
     conn = kb.connect()
@@ -359,10 +448,39 @@ def build_close_thread_packet(
     parent_tasks = [item for item in parent_tasks if item]
     child_tasks = [item for item in child_tasks if item]
 
-    has_anchor = task is not None
-    decisions = _extract_decisions(task, comments, runs)
+    thread_anchor = str(source.get("thread_id") or "").strip() or None
+    run_anchor = str(session.get("run_id") or "").strip() or None
+    has_anchor = task is not None or thread_anchor is not None or run_anchor is not None
+
+    # Extract Linear data from closeout context for decision scoring
+    linear_context = closeout_context.get("linear") or {}
+    linear_comments = linear_context.get("comments") if isinstance(linear_context, dict) else None
+    linear_issue_status = linear_context.get("issue_status") if isinstance(linear_context, dict) else None
+    linear_previous_status = linear_context.get("issue_previous_status") if isinstance(linear_context, dict) else None
+
+    decisions = _extract_decisions(task, comments, runs,
+        linear_comments=linear_comments,
+        linear_issue_status=linear_issue_status,
+        linear_previous_status=linear_previous_status)
     actions = _extract_actions(task, child_tasks, runs)
     risks = _extract_risks(task, comments, latest_run)
+
+    def _extend_unique(target: list[Any], values: Any) -> None:
+        if not isinstance(values, list):
+            return
+        seen = {str(item) for item in target}
+        for item in values:
+            cleaned = str(item).strip()
+            if cleaned and cleaned not in seen:
+                target.append(cleaned)
+                seen.add(cleaned)
+
+    _extend_unique(decisions, extracted_context.get("decisions"))
+    _extend_unique(decisions, extracted_context.get("approvals"))
+    _extend_unique(actions, extracted_context.get("action_items"))
+    _extend_unique(risks, extracted_context.get("blockers"))
+    task_scan_status = str(task_scan.get("status") or "") or None
+    blocker_scan_status = str(blocker_scan.get("status") or "") or None
     blocker_refs: list[dict[str, Any]] = []
     if task and task.status == "blocked":
         blocker_refs.append({
@@ -378,7 +496,7 @@ def build_close_thread_packet(
             "source_task": opts.task_id,
             "delivery": "queued_or_blocked" if opts.post_human_review else "suppressed",
         })
-    elif opts.mode == "close":
+    elif opts.mode == "close" and task is not None and not thread_anchor:
         human_review_packets["queued"].append({
             "packet_type": "APPROVAL_NEEDED",
             "requested_action": "approve any live Discord archive/lock behavior before enabling close mode mutations",
@@ -387,6 +505,25 @@ def build_close_thread_packet(
         })
     elif not opts.post_human_review:
         human_review_packets["not_emitted_reason"] = "post_human_review=false"
+
+    context_blockers = extracted_context.get("blockers")
+    if not isinstance(context_blockers, list):
+        context_blockers = []
+    for blocker in context_blockers:
+        cleaned_blocker = _redact_text(str(blocker).strip())
+        if cleaned_blocker:
+            blocker_refs.append({
+                "source": "discord_thread",
+                "status": "open",
+                "reason": cleaned_blocker,
+            })
+    if blocker_refs and not human_review_packets["queued"]:
+        human_review_packets["queued"].append({
+            "packet_type": "BLOCKED_NEEDS_HUMAN",
+            "requested_action": "resolve open blocker(s) before archiving Discord thread",
+            "source_task": opts.task_id,
+            "delivery": "queued_or_blocked" if opts.post_human_review else "suppressed",
+        })
 
     evidence_paths: list[str] = []
     if task and task.workspace_path:
@@ -405,6 +542,25 @@ def build_close_thread_packet(
             if isinstance(changed, list):
                 evidence_paths.extend(str(item) for item in changed[:10])
 
+    context_changed_files = implementation_context.get("changed_files")
+    if isinstance(context_changed_files, list):
+        evidence_paths.extend(str(item) for item in context_changed_files if str(item).strip())
+    context_tests = implementation_context.get("tests_run")
+    if isinstance(context_tests, list):
+        for item in context_tests:
+            if isinstance(item, dict):
+                tests_or_smokes.append(_redact(deepcopy(item)))
+            else:
+                tests_or_smokes.append({"command": _redact_text(str(item)), "result": "mentioned"})
+    context_links = extracted_context.get("links")
+    if isinstance(context_links, list):
+        evidence_paths.extend(str(item) for item in context_links if str(item).strip())
+    context_attachments = extracted_context.get("attachments")
+    if isinstance(context_attachments, list):
+        for item in context_attachments:
+            if isinstance(item, dict) and item.get("url"):
+                evidence_paths.append(str(item["url"]))
+
     dimensions, total_score, status = _score_closeout(
         has_anchor=has_anchor,
         decisions=decisions,
@@ -413,10 +569,16 @@ def build_close_thread_packet(
         evidence_count=len(evidence_paths) + len(tests_or_smokes),
         human_review_count=len(human_review_packets["emitted"]) + len(human_review_packets["queued"]),
         include_memory=opts.include_memory,
+        task_scan_status=task_scan_status,
+        blocker_scan_status=blocker_scan_status,
     )
 
-    if has_anchor:
+    if task:
         durable_anchor = f"Kanban {task.id}"
+    elif thread_anchor:
+        durable_anchor = f"Discord thread {thread_anchor}"
+    elif run_anchor:
+        durable_anchor = f"Hermes run {run_anchor}"
     elif opts.task_id:
         durable_anchor = f"missing task {opts.task_id}"
     else:
@@ -497,6 +659,23 @@ def build_close_thread_packet(
             "thread_label_ids": thread_label_ids,
             "thread_labels": thread_labels,
         },
+        "thread_transcript": {
+            "message_count": thread_transcript.get("message_count", 0),
+            "messages_captured": thread_transcript.get("messages_captured", []),
+            "truncated": bool(thread_transcript.get("truncated", False)),
+            "fetch_window": thread_transcript.get("fetch_window", {}),
+            "collector_error": thread_transcript.get("collector_error"),
+        },
+        "extracted": {
+            "decisions": extracted_context.get("decisions", []),
+            "action_items": extracted_context.get("action_items", []),
+            "blockers": extracted_context.get("blockers", []),
+            "approvals": extracted_context.get("approvals", []),
+            "links": extracted_context.get("links", []),
+            "attachments": extracted_context.get("attachments", []),
+        },
+        "session_refs": session_refs_context,
+        "implementation_refs": implementation_context,
         "tasks": {
             "created": [],
             "updated": [],
@@ -540,7 +719,10 @@ def build_close_thread_packet(
                 if not has_anchor
                 else (
                     "Review the queued approval packet before enabling live close behavior."
-                    if opts.mode == "close"
+                    if any(
+                        packet.get("packet_type") == "APPROVAL_NEEDED"
+                        for packet in human_review_packets["queued"]
+                    )
                     else "Review the closeout artifact and proceed with any remaining Kanban follow-up."
                 )
             ),
@@ -582,7 +764,15 @@ def build_close_thread_packet(
         "Safety: no secrets; no unapproved Discord/gateway mutation",
     ]
     response_text = "\n".join(response_lines)
-    slug = _slugify(task.id if task else (opts.task_id or "unanchored"))
+    if task:
+        slug_source = task.id
+    elif thread_anchor:
+        slug_source = f"discord-thread-{thread_anchor}"
+    elif run_anchor:
+        slug_source = f"hermes-run-{run_anchor}"
+    else:
+        slug_source = opts.task_id or "unanchored"
+    slug = _slugify(slug_source)
     json_path, md_path = _write_packet_files(packet, response_text, slug, now_dt)
     packet["closeout_artifacts"] = {"json_path": json_path, "markdown_path": md_path}
     response_lines[10] = f"Artifact: {json_path}"
@@ -602,6 +792,12 @@ def run_close_thread(
     *,
     source: dict[str, Any] | None = None,
     session: dict[str, Any] | None = None,
+    closeout_context: dict[str, Any] | None = None,
 ) -> str:
-    _packet, response = build_close_thread_packet(command_text, source=source, session=session)
+    _packet, response = build_close_thread_packet(
+        command_text,
+        source=source,
+        session=session,
+        closeout_context=closeout_context,
+    )
     return response
