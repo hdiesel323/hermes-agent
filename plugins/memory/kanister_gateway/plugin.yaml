@@ -1,0 +1,7 @@
+name: kanister_gateway
+version: 1.0.0
+description: "Kanister Gateway — host-local unified memory sidecar with normalized recall, session events, and outcome mirroring."
+hooks:
+  - on_session_end
+  - on_memory_write
+  - on_delegation
