@@ -88,6 +88,19 @@ def test_config_is_profile_scoped_and_env_overrides(monkeypatch, tmp_path):
     assert cfg["recall_limit"] == 9
 
 
+def test_default_endpoint_matches_the_host_sidecar_port(monkeypatch, tmp_path):
+    for name in (
+        "KANISTER_GATEWAY_ENDPOINT",
+        "KANISTER_GATEWAY_API_KEY",
+        "KANISTER_GATEWAY_NAMESPACE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    cfg = _load_config(tmp_path)
+
+    assert cfg["endpoint"] == "http://127.0.0.1:17890"
+
+
 def test_tools_are_gateway_only_and_do_not_expose_backends():
     provider = KanisterGatewayMemoryProvider()
 

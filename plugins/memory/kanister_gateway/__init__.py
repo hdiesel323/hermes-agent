@@ -10,7 +10,7 @@ Config resolution:
   3. Environment variables
 
 Environment overrides:
-  KANISTER_GATEWAY_ENDPOINT       default: http://127.0.0.1:8765
+  KANISTER_GATEWAY_ENDPOINT       default: http://127.0.0.1:17890
   KANISTER_GATEWAY_API_KEY        optional bearer token
   KANISTER_GATEWAY_NAMESPACE      default: hermes
   KANISTER_GATEWAY_TIMEOUT        default: 8.0 seconds
@@ -38,7 +38,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_ENDPOINT = "http://127.0.0.1:8765"
+_DEFAULT_ENDPOINT = "http://127.0.0.1:17890"
 _DEFAULT_TIMEOUT = 8.0
 _DEFAULT_QUEUE_SIZE = 128
 _DEFAULT_RECALL_LIMIT = 6
