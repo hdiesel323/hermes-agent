@@ -2,6 +2,7 @@ import json
 import time
 
 from plugins.memory.kanister_gateway import (
+    _MAX_TOOL_RESULT_CHARS,
     KanisterGatewayMemoryProvider,
     _format_recall_context,
     _load_config,
@@ -256,7 +257,49 @@ def test_tool_recall_returns_normalized_json(monkeypatch, tmp_path):
     result = json.loads(provider.handle_tool_call("kanister_recall", {"query": "preferences"}))
 
     assert result["count"] == 1
+    assert result["total_count"] == 1
+    assert result["truncated"] is False
     assert result["results"][0]["text"] == "User prefers concise engineering summaries."
     assert "Kanister Memory Context" in result["context"]
+
+    provider.shutdown()
+
+
+def test_tool_recall_bounds_large_results_without_cutting_json(monkeypatch, tmp_path):
+    class LargeRecallClient(FakeKanisterClient):
+        def recall(self, payload):
+            self.recall_payloads.append(payload)
+            return {
+                "results": [
+                    {
+                        "content": f"memory-{index}: " + ("x" * 5000),
+                        "score": 0.9,
+                        "provenance": {
+                            "source": f"kanister://large/{index}/" + ("s" * 2000),
+                            "untrusted_blob": "y" * 10000,
+                        },
+                    }
+                    for index in range(20)
+                ]
+            }
+
+    monkeypatch.setattr(
+        "plugins.memory.kanister_gateway._KanisterGatewayClient",
+        lambda *args, **kwargs: LargeRecallClient(*args, **kwargs),
+    )
+    monkeypatch.setattr("plugins.memory.kanister_gateway.get_hermes_home", lambda: tmp_path)
+
+    provider = KanisterGatewayMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+
+    encoded = provider.handle_tool_call("kanister_recall", {"query": "large", "limit": 20})
+    result = json.loads(encoded)
+
+    assert len(encoded) <= _MAX_TOOL_RESULT_CHARS
+    assert result["total_count"] == 20
+    assert result["truncated"] is True
+    assert result["count"] == len(result["results"])
+    assert result["count"] > 0
+    assert all("untrusted_blob" not in item["provenance"] for item in result["results"])
 
     provider.shutdown()

@@ -45,6 +45,7 @@ _DEFAULT_RECALL_LIMIT = 6
 _DEFAULT_PREFETCH_STALE_SECONDS = 300
 _MAX_CONTEXT_ITEM_CHARS = 900
 _MAX_TOOL_RESULT_CHARS = 6000
+_MAX_TOOL_PROVENANCE_CHARS = 512
 
 
 RECALL_SCHEMA = {
@@ -402,6 +403,69 @@ def _format_recall_context(
     return "\n".join(lines)
 
 
+def _bounded_recall_tool_result(normalized: list[dict[str, Any]]) -> str:
+    """Return a size-bounded recall payload without ever cutting JSON syntax."""
+    total_count = len(normalized)
+    bounded: list[dict[str, Any]] = []
+    provenance_keys = (
+        "source",
+        "citation",
+        "uri",
+        "id",
+        "provider",
+        "created_at",
+        "updated_at",
+        "stale",
+        "partial",
+    )
+
+    for entry in normalized:
+        result: dict[str, Any] = {
+            "text": _clean_content(entry.get("text", ""), limit=_MAX_CONTEXT_ITEM_CHARS),
+        }
+        provenance: dict[str, Any] = {}
+        raw_provenance = entry.get("provenance")
+        if isinstance(raw_provenance, dict):
+            for key in provenance_keys:
+                value = raw_provenance.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    provenance[key] = _clean_content(value, limit=_MAX_TOOL_PROVENANCE_CHARS)
+                elif isinstance(value, (bool, int, float)):
+                    provenance[key] = value
+        result["provenance"] = provenance
+        if entry.get("score") is not None:
+            result["score"] = entry["score"]
+        bounded.append(result)
+
+    while True:
+        payload = {
+            "results": bounded,
+            "context": _format_recall_context(bounded),
+            "count": len(bounded),
+            "total_count": total_count,
+            "truncated": len(bounded) < total_count,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False)
+        if len(encoded) <= _MAX_TOOL_RESULT_CHARS:
+            return encoded
+        if bounded:
+            bounded.pop()
+            continue
+
+        # This should fit comfortably, but keep the invariant explicit if the
+        # response schema grows in the future.
+        fallback = {
+            "results": [],
+            "context": "",
+            "count": 0,
+            "total_count": total_count,
+            "truncated": total_count > 0,
+        }
+        return json.dumps(fallback, ensure_ascii=False)
+
+
 class KanisterGatewayMemoryProvider(MemoryProvider):
     """MemoryProvider adapter for the Unified Kanister Memory Plane sidecar."""
 
@@ -674,11 +738,7 @@ class KanisterGatewayMemoryProvider(MemoryProvider):
         try:
             response = self._client.recall(payload)
             normalized = _normalize_recall_payload(response, limit=limit)
-            return json.dumps({
-                "results": normalized,
-                "context": _format_recall_context(normalized),
-                "count": len(normalized),
-            }, ensure_ascii=False)[:_MAX_TOOL_RESULT_CHARS]
+            return _bounded_recall_tool_result(normalized)
         except Exception as exc:
             return tool_error(f"Kanister recall failed: {self._safe_error(exc)}")
 
